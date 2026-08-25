@@ -3,6 +3,7 @@ import re
 import logging
 import sqlite3
 import requests
+import json
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 
@@ -11,7 +12,7 @@ CBE_FORWARD_URL = os.environ.get("CBE_FORWARD_URL", "https://mb.cbe.com.et/api/v
 CBE_APP_ID = os.environ.get("CBE_APP_ID", "3fa85f64-5717-4562-b3fc-2c963f66afa6")
 CBE_APP_VERSION = os.environ.get("CBE_APP_VERSION", "123e4567-e89b-12d3-a456-426614174000")
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 log = logging.getLogger("webhook-server")
 
 app = Flask(__name__)
@@ -59,34 +60,47 @@ def forward_to_cbe(tx_id: str, parsed_qr: dict, amount: float):
         return "skipped", None
     
     try:
-        # CBE API REQUIRES @class property for Jackson polymorphic deserialization
-        # This is CRITICAL - without it you get:
-        # "missing type id property '@class'" error with HTTP 400
-        payload = {
-            "@class": "com.cbe.transaction.dto.TransactionDetailRequest",
-            "transactionId": tx_id,
-        }
+        # Try different @class values to find the correct one
+        class_names = [
+            "com.cbe.transaction.dto.TransactionDetailRequest",
+            "com.cbe.api.transaction.TransactionDetailRequest",
+            "com.cbe.transaction.TransactionDetailRequest",
+            "TransactionDetailRequest",
+            "com.example.Transaction"
+        ]
         
-        headers = {
-            "Content-Type": "application/json",
-            "X-App-Id": CBE_APP_ID,
-            "X-App-Version": CBE_APP_VERSION,
-        }
+        for class_name in class_names:
+            payload = {
+                "@class": class_name,
+                "transactionId": tx_id,
+            }
+            
+            headers = {
+                "Content-Type": "application/json",
+                "X-App-Id": CBE_APP_ID,
+                "X-App-Version": CBE_APP_VERSION,
+            }
+            
+            log.info(f"[ATTEMPT] Forwarding POST with @class={class_name}")
+            log.info(f"[URL] {CBE_FORWARD_URL}")
+            log.info(f"[PAYLOAD] {json.dumps(payload)}")
+            log.info(f"[HEADERS] {json.dumps(headers)}")
+            
+            resp = requests.post(CBE_FORWARD_URL, json=payload, headers=headers, timeout=10, verify=False)
+            status = f"HTTP_{resp.status_code}"
+            
+            log.info(f"[RESPONSE] Status: {status}")
+            log.info(f"[RESPONSE] Body: {resp.text[:500]}")
+            
+            # Store response with class name info
+            response_text = f"@class={class_name}\nStatus: {status}\n{resp.text}"
+            
+            # Return first response (we'll keep trying until one works)
+            return status, response_text
         
-        log.info(f"Forwarding POST to: {CBE_FORWARD_URL}")
-        log.info(f"DEBUG HEADERS -> X-App-Id: {CBE_APP_ID}, X-App-Version: {CBE_APP_VERSION}")
-        log.info(f"DEBUG PAYLOAD -> {payload}")
-        
-        # Use POST with JSON body
-        resp = requests.post(CBE_FORWARD_URL, json=payload, headers=headers, timeout=10, verify=False)
-        status = f"HTTP_{resp.status_code}"
-        
-        log.info(f"Forward: {tx_id} -> {status}")
-        
-        # Store full response for debugging
-        return status, resp.text
+        return "tried_multiple", None
     except Exception as exc:
-        log.error(f"Forward error: {str(exc)}")
+        log.error(f"[ERROR] Forward error: {str(exc)}")
         return f"failed_{str(exc)}", str(exc)
 
 @app.before_request
@@ -103,7 +117,8 @@ def handle_webhook():
         raw_bytes = request.get_data()
         qr_string = raw_bytes.decode('utf-8', errors='ignore')
         
-        log.info(f"DEBUG: Raw request data length: {len(qr_string)}")
+        log.info(f"[WEBHOOK] Raw request data length: {len(qr_string)}")
+        log.info(f"[WEBHOOK] QR Data: {qr_string[:100]}...")
         
         # Extract transaction ID from QR
         txn_match = re.search(r"(Txn_[A-Za-z0-9]+)", qr_string)
@@ -111,6 +126,7 @@ def handle_webhook():
         
         # Parse EMV QR data
         parsed_qr = parse_emv_qr(qr_string)
+        log.info(f"[WEBHOOK] Parsed QR: {json.dumps(parsed_qr)}")
         
         # Extract amount (tag 54 in EMV format)
         amount_str = parsed_qr.get("54", "0")
@@ -139,7 +155,7 @@ def handle_webhook():
         conn.commit()
         conn.close()
         
-        log.info(f"CBE Webhook: {txn_id} -> SETTLED, amount={amount_val}")
+        log.info(f"[WEBHOOK] Complete: {txn_id} -> {forward_status}")
         
         return jsonify({
             "transaction_id": txn_id,
@@ -149,7 +165,7 @@ def handle_webhook():
         }), 200
     
     except Exception as e:
-        log.error(f"Error processing webhook: {str(e)}")
+        log.error(f"[ERROR] Error processing webhook: {str(e)}")
         return jsonify({"error": str(e), "status": "error"}), 500
 
 if __name__ == "__main__":
