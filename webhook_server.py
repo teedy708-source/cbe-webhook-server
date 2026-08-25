@@ -9,8 +9,8 @@ from flask import Flask, request, jsonify
 
 DB_PATH = os.path.expanduser(os.environ.get("LEDGER_DB", "~/ledger.db"))
 CBE_FORWARD_URL = os.environ.get("CBE_FORWARD_URL", "https://mb.cbe.com.et/api/v1/transactions/public/transaction-detail")
-CBE_APP_ID = os.environ.get("CBE_APP_ID", "3fa85f64-5717-4562-b3fc-2c963f66afa6")
-CBE_APP_VERSION = os.environ.get("CBE_APP_VERSION", "123e4567-e89b-12d3-a456-426614174000")
+CBE_APP_ID = os.environ.get("CBE_APP_ID", "")
+CBE_APP_VERSION = os.environ.get("CBE_APP_VERSION", "")
 
 logging.basicConfig(level=logging.DEBUG)
 log = logging.getLogger("webhook-server")
@@ -55,53 +55,81 @@ def parse_emv_qr(qr_string: str) -> dict:
     return data
 
 def forward_to_cbe(tx_id: str, parsed_qr: dict, amount: float):
-    """Forward transaction to CBE API with proper JSON payload"""
+    """Forward transaction to CBE API with multiple payload format attempts"""
     if not CBE_FORWARD_URL:
         return "skipped", None
     
-    try:
-        # Try different @class values to find the correct one
-        class_names = [
-            "com.cbe.transaction.dto.TransactionDetailRequest",
-            "com.cbe.api.transaction.TransactionDetailRequest",
-            "com.cbe.transaction.TransactionDetailRequest",
-            "TransactionDetailRequest",
-            "com.example.Transaction"
-        ]
-        
-        for class_name in class_names:
-            payload = {
-                "@class": class_name,
+    headers_base = {
+        "Content-Type": "application/json",
+        "X-App-Id": CBE_APP_ID,
+        "X-App-Version": CBE_APP_VERSION,
+    }
+    
+    # Test different payload formats
+    payloads_to_try = [
+        # Format 1: Array of objects (since error mentions "index 0")
+        {
+            "name": "Array Format",
+            "payload": [
+                {
+                    "@class": "com.cbe.transaction.dto.TransactionDetailRequest",
+                    "transactionId": tx_id,
+                }
+            ]
+        },
+        # Format 2: Object with @class (original)
+        {
+            "name": "Object with @class",
+            "payload": {
+                "@class": "com.cbe.transaction.dto.TransactionDetailRequest",
                 "transactionId": tx_id,
             }
-            
-            headers = {
-                "Content-Type": "application/json",
-                "X-App-Id": CBE_APP_ID,
-                "X-App-Version": CBE_APP_VERSION,
+        },
+        # Format 3: Just transaction ID
+        {
+            "name": "Simple Object",
+            "payload": {
+                "transactionId": tx_id,
             }
+        },
+        # Format 4: Array with simple object
+        {
+            "name": "Array Simple",
+            "payload": [
+                {
+                    "transactionId": tx_id,
+                }
+            ]
+        },
+    ]
+    
+    for attempt in payloads_to_try:
+        try:
+            log.info(f"[ATTEMPT] {attempt['name']}")
+            log.info(f"[PAYLOAD] {json.dumps(attempt['payload'])}")
             
-            log.info(f"[ATTEMPT] Forwarding POST with @class={class_name}")
-            log.info(f"[URL] {CBE_FORWARD_URL}")
-            log.info(f"[PAYLOAD] {json.dumps(payload)}")
-            log.info(f"[HEADERS] {json.dumps(headers)}")
-            
-            resp = requests.post(CBE_FORWARD_URL, json=payload, headers=headers, timeout=10, verify=False)
+            resp = requests.post(
+                CBE_FORWARD_URL, 
+                json=attempt['payload'], 
+                headers=headers_base, 
+                timeout=10, 
+                verify=False
+            )
             status = f"HTTP_{resp.status_code}"
             
             log.info(f"[RESPONSE] Status: {status}")
             log.info(f"[RESPONSE] Body: {resp.text[:500]}")
             
-            # Store response with class name info
-            response_text = f"@class={class_name}\nStatus: {status}\n{resp.text}"
+            # Store response with attempt info
+            response_text = f"Format: {attempt['name']}\nStatus: {status}\n{resp.text}"
             
-            # Return first response (we'll keep trying until one works)
+            # Return first response (could be success or we analyze all)
             return status, response_text
-        
-        return "tried_multiple", None
-    except Exception as exc:
-        log.error(f"[ERROR] Forward error: {str(exc)}")
-        return f"failed_{str(exc)}", str(exc)
+        except Exception as exc:
+            log.error(f"[ERROR] {attempt['name']}: {str(exc)}")
+            continue
+    
+    return "all_attempts_failed", None
 
 @app.before_request
 def setup():
@@ -117,8 +145,7 @@ def handle_webhook():
         raw_bytes = request.get_data()
         qr_string = raw_bytes.decode('utf-8', errors='ignore')
         
-        log.info(f"[WEBHOOK] Raw request data length: {len(qr_string)}")
-        log.info(f"[WEBHOOK] QR Data: {qr_string[:100]}...")
+        log.info(f"[WEBHOOK] Received QR of length: {len(qr_string)}")
         
         # Extract transaction ID from QR
         txn_match = re.search(r"(Txn_[A-Za-z0-9]+)", qr_string)
@@ -126,7 +153,6 @@ def handle_webhook():
         
         # Parse EMV QR data
         parsed_qr = parse_emv_qr(qr_string)
-        log.info(f"[WEBHOOK] Parsed QR: {json.dumps(parsed_qr)}")
         
         # Extract amount (tag 54 in EMV format)
         amount_str = parsed_qr.get("54", "0")
@@ -155,7 +181,7 @@ def handle_webhook():
         conn.commit()
         conn.close()
         
-        log.info(f"[WEBHOOK] Complete: {txn_id} -> {forward_status}")
+        log.info(f"[WEBHOOK] Stored: {txn_id} -> {forward_status}")
         
         return jsonify({
             "transaction_id": txn_id,
@@ -165,7 +191,7 @@ def handle_webhook():
         }), 200
     
     except Exception as e:
-        log.error(f"[ERROR] Error processing webhook: {str(e)}")
+        log.error(f"[ERROR] Webhook error: {str(e)}")
         return jsonify({"error": str(e), "status": "error"}), 500
 
 if __name__ == "__main__":
