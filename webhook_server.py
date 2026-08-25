@@ -77,7 +77,7 @@ def forward_to_cbe(tx_id: str, parsed_qr: dict, amount: float):
         log.info(f"DEBUG HEADERS -> X-App-Id: {CBE_APP_ID}, X-App-Version: {CBE_APP_VERSION}")
         log.info(f"DEBUG PAYLOAD -> {payload}")
         
-        # Use POST, not GET
+        # Use POST with JSON body
         resp = requests.post(CBE_FORWARD_URL, json=payload, headers=headers, timeout=10, verify=False)
         status = f"HTTP_{resp.status_code}"
         
