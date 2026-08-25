@@ -7,8 +7,9 @@ from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 
 DB_PATH = os.path.expanduser(os.environ.get("LEDGER_DB", "~/ledger.db"))
-FORWARD_URL = os.environ.get("CBE_FORWARD_URL")
-API_KEY = os.environ.get("CBE_API_KEY", "")
+CBE_FORWARD_URL = os.environ.get("CBE_FORWARD_URL", "https://mb.cbe.com.et/api/v1/transactions/public/transaction-detail")
+CBE_APP_ID = os.environ.get("CBE_APP_ID", "3fa85f64-5717-4562-b3fc-2c963f66afa6")
+CBE_APP_VERSION = os.environ.get("CBE_APP_VERSION", "123e4567-e89b-12d3-a456-426614174000")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("webhook-server")
@@ -54,30 +55,39 @@ def parse_emv_qr(qr_string: str) -> dict:
 
 def forward_to_cbe(tx_id: str, parsed_qr: dict, amount: float):
     """Forward transaction to CBE API with proper JSON payload"""
-    if not FORWARD_URL:
-        return "skipped"
+    if not CBE_FORWARD_URL:
+        return "skipped", None
     
     try:
-        # CBE API expects @class property for polymorphic deserialization
+        # CBE API REQUIRES @class property for Jackson polymorphic deserialization
+        # This is CRITICAL - without it you get:
+        # "missing type id property '@class'" error with HTTP 400
         payload = {
             "@class": "com.cbe.transaction.dto.TransactionDetailRequest",
             "transactionId": tx_id,
-            "amount": amount,
-            "currency": "ETB"
         }
         
         headers = {
             "Content-Type": "application/json",
-            "X-API-Key": API_KEY
+            "X-App-Id": CBE_APP_ID,
+            "X-App-Version": CBE_APP_VERSION,
         }
         
-        resp = requests.post(FORWARD_URL, json=payload, headers=headers, timeout=10, verify=False)
+        log.info(f"Forwarding POST to: {CBE_FORWARD_URL}")
+        log.info(f"DEBUG HEADERS -> X-App-Id: {CBE_APP_ID}, X-App-Version: {CBE_APP_VERSION}")
+        log.info(f"DEBUG PAYLOAD -> {payload}")
+        
+        # Use POST, not GET
+        resp = requests.post(CBE_FORWARD_URL, json=payload, headers=headers, timeout=10, verify=False)
         status = f"HTTP_{resp.status_code}"
         
-        # Store response for debugging
+        log.info(f"Forward: {tx_id} -> {status}")
+        
+        # Store full response for debugging
         return status, resp.text
     except Exception as exc:
-        return f"failed_{str(exc)}", None
+        log.error(f"Forward error: {str(exc)}")
+        return f"failed_{str(exc)}", str(exc)
 
 @app.before_request
 def setup():
@@ -93,7 +103,7 @@ def handle_webhook():
         raw_bytes = request.get_data()
         qr_string = raw_bytes.decode('utf-8', errors='ignore')
         
-        log.info(f"Received QR string of length: {len(qr_string)}")
+        log.info(f"DEBUG: Raw request data length: {len(qr_string)}")
         
         # Extract transaction ID from QR
         txn_match = re.search(r"(Txn_[A-Za-z0-9]+)", qr_string)
@@ -116,12 +126,7 @@ def handle_webhook():
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         
         # Forward to CBE and get response
-        forward_result = forward_to_cbe(txn_id, parsed_qr, amount_val)
-        if isinstance(forward_result, tuple):
-            forward_status, cbe_response = forward_result
-        else:
-            forward_status = forward_result
-            cbe_response = None
+        forward_status, cbe_response = forward_to_cbe(txn_id, parsed_qr, amount_val)
         
         # Store in database
         conn = sqlite3.connect(DB_PATH)
