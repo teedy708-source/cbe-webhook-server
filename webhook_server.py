@@ -8,11 +8,12 @@ from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 
 DB_PATH = os.path.expanduser(os.environ.get("LEDGER_DB", "~/ledger.db"))
-CBE_FORWARD_URL = os.environ.get("CBE_FORWARD_URL", "https://mb.cbe.com.et/api/v1/transactions/public/transaction-detail")
+CBE_FORWARD_URL = os.environ.get("CBE_FORWARD_URL", "https://mb.cbe.com.et/api/v1/transactions/notify")
 CBE_APP_ID = os.environ.get("CBE_APP_ID", "")
 CBE_APP_VERSION = os.environ.get("CBE_APP_VERSION", "")
+CBE_API_KEY = os.environ.get("CBE_API_KEY", "")
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("webhook-server")
 
 app = Flask(__name__)
@@ -54,82 +55,57 @@ def parse_emv_qr(qr_string: str) -> dict:
         i += 4 + length
     return data
 
-def forward_to_cbe(tx_id: str, parsed_qr: dict, amount: float):
-    """Forward transaction to CBE API with multiple payload format attempts"""
+def forward_to_cbe(tx_id: str, parsed_qr: dict, amount: float, receiver: str):
+    """Forward transaction notification to CBE API"""
     if not CBE_FORWARD_URL:
         return "skipped", None
     
-    headers_base = {
-        "Content-Type": "application/json",
-        "X-App-Id": CBE_APP_ID,
-        "X-App-Version": CBE_APP_VERSION,
-    }
-    
-    # Test different payload formats
-    payloads_to_try = [
-        # Format 1: Array of objects (since error mentions "index 0")
-        {
-            "name": "Array Format",
-            "payload": [
-                {
-                    "@class": "com.cbe.transaction.dto.TransactionDetailRequest",
-                    "transactionId": tx_id,
-                }
-            ]
-        },
-        # Format 2: Object with @class (original)
-        {
-            "name": "Object with @class",
-            "payload": {
-                "@class": "com.cbe.transaction.dto.TransactionDetailRequest",
-                "transactionId": tx_id,
-            }
-        },
-        # Format 3: Just transaction ID
-        {
-            "name": "Simple Object",
-            "payload": {
-                "transactionId": tx_id,
-            }
-        },
-        # Format 4: Array with simple object
-        {
-            "name": "Array Simple",
-            "payload": [
-                {
-                    "transactionId": tx_id,
-                }
-            ]
-        },
-    ]
-    
-    for attempt in payloads_to_try:
-        try:
-            log.info(f"[ATTEMPT] {attempt['name']}")
-            log.info(f"[PAYLOAD] {json.dumps(attempt['payload'])}")
-            
-            resp = requests.post(
-                CBE_FORWARD_URL, 
-                json=attempt['payload'], 
-                headers=headers_base, 
-                timeout=10, 
-                verify=False
-            )
-            status = f"HTTP_{resp.status_code}"
-            
-            log.info(f"[RESPONSE] Status: {status}")
-            log.info(f"[RESPONSE] Body: {resp.text[:500]}")
-            
-            # Store response with attempt info
-            response_text = f"Format: {attempt['name']}\nStatus: {status}\n{resp.text}"
-            
-            # Return first response (could be success or we analyze all)
-            return status, response_text
-        except Exception as exc:
-            log.error(f"[ERROR] {attempt['name']}: {str(exc)}")
-            continue
-    
-    return "all_attempts_failed", None
+    try:
+        # Payload for /notify endpoint
+        payload = {
+            "@class": "com.cbe.transaction.dto.TransactionNotifyRequest",
+            "transactionId": tx_id,
+            "amount": amount,
+            "currency": "ETB",
+            "beneficiary": receiver,
+            "status": "COMPLETED",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        
+        headers = {
+            "Content-Type": "application/json",
+            "X-App-Id": CBE_APP_ID,
+            "X-App-Version": CBE_APP_VERSION,
+            "Authorization": f"Bearer {CBE_API_KEY}" if CBE_API_KEY else ""
+        }
+        
+        # Remove empty authorization header
+        if not CBE_API_KEY:
+            del headers["Authorization"]
+        
+        log.info(f"[NOTIFY] Forwarding to: {CBE_FORWARD_URL}")
+        log.info(f"[NOTIFY] Transaction: {tx_id}, Amount: {amount} ETB")
+        log.info(f"[NOTIFY] Payload: {json.dumps(payload)}")
+        
+        resp = requests.post(
+            CBE_FORWARD_URL,
+            json=payload,
+            headers=headers,
+            timeout=10,
+            verify=False
+        )
+        status = f"HTTP_{resp.status_code}"
+        
+        log.info(f"[NOTIFY] Response: {status}")
+        log.info(f"[NOTIFY] Body: {resp.text[:500]}")
+        
+        # Store response
+        response_text = f"Status: {status}\n{resp.text}"
+        return status, response_text
+        
+    except Exception as exc:
+        log.error(f"[ERROR] Forward error: {str(exc)}")
+        return f"failed_{str(exc)}", str(exc)
 
 @app.before_request
 def setup():
@@ -146,6 +122,7 @@ def handle_webhook():
         qr_string = raw_bytes.decode('utf-8', errors='ignore')
         
         log.info(f"[WEBHOOK] Received QR of length: {len(qr_string)}")
+        log.info(f"[WEBHOOK] QR Data: {qr_string[:100]}...")
         
         # Extract transaction ID from QR
         txn_match = re.search(r"(Txn_[A-Za-z0-9]+)", qr_string)
@@ -153,6 +130,7 @@ def handle_webhook():
         
         # Parse EMV QR data
         parsed_qr = parse_emv_qr(qr_string)
+        log.info(f"[WEBHOOK] Parsed tags: {list(parsed_qr.keys())}")
         
         # Extract amount (tag 54 in EMV format)
         amount_str = parsed_qr.get("54", "0")
@@ -167,8 +145,8 @@ def handle_webhook():
         # Current timestamp
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         
-        # Forward to CBE and get response
-        forward_status, cbe_response = forward_to_cbe(txn_id, parsed_qr, amount_val)
+        # Forward to CBE
+        forward_status, cbe_response = forward_to_cbe(txn_id, parsed_qr, amount_val, receiver)
         
         # Store in database
         conn = sqlite3.connect(DB_PATH)
@@ -177,7 +155,7 @@ def handle_webhook():
             INSERT OR REPLACE INTO transactions
             (transaction_id, receiver_account, gross_amount, net_amount, currency, settlement_status, cbe_response, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (txn_id, receiver, amount_val, amount_val, "ETB", "SETTLED", cbe_response, now_str, now_str))
+        ''', (txn_id, receiver, amount_val, amount_val, "ETB", "NOTIFIED", cbe_response, now_str, now_str))
         conn.commit()
         conn.close()
         
