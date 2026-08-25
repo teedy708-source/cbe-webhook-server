@@ -56,56 +56,65 @@ def parse_emv_qr(qr_string: str) -> dict:
     return data
 
 def forward_to_cbe(tx_id: str, parsed_qr: dict, amount: float, receiver: str):
-    """Forward transaction notification to CBE API"""
+    """Forward transaction notification to CBE API with multiple @class attempts"""
     if not CBE_FORWARD_URL:
         return "skipped", None
     
-    try:
-        # Payload for /notify endpoint
-        payload = {
-            "@class": "com.cbe.transaction.dto.TransactionNotifyRequest",
-            "transactionId": tx_id,
-            "amount": amount,
-            "currency": "ETB",
-            "beneficiary": receiver,
-            "status": "COMPLETED",
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
-        
-        headers = {
-            "Content-Type": "application/json",
-            "X-App-Id": CBE_APP_ID,
-            "X-App-Version": CBE_APP_VERSION,
-            "Authorization": f"Bearer {CBE_API_KEY}" if CBE_API_KEY else ""
-        }
-        
-        # Remove empty authorization header
-        if not CBE_API_KEY:
-            del headers["Authorization"]
-        
-        log.info(f"[NOTIFY] Forwarding to: {CBE_FORWARD_URL}")
-        log.info(f"[NOTIFY] Transaction: {tx_id}, Amount: {amount} ETB")
-        log.info(f"[NOTIFY] Payload: {json.dumps(payload)}")
-        
-        resp = requests.post(
-            CBE_FORWARD_URL,
-            json=payload,
-            headers=headers,
-            timeout=10,
-            verify=False
-        )
-        status = f"HTTP_{resp.status_code}"
-        
-        log.info(f"[NOTIFY] Response: {status}")
-        log.info(f"[NOTIFY] Body: {resp.text[:500]}")
-        
-        # Store response
-        response_text = f"Status: {status}\n{resp.text}"
-        return status, response_text
-        
-    except Exception as exc:
-        log.error(f"[ERROR] Forward error: {str(exc)}")
-        return f"failed_{str(exc)}", str(exc)
+    headers_base = {
+        "Content-Type": "application/json",
+        "X-App-Id": CBE_APP_ID,
+        "X-App-Version": CBE_APP_VERSION,
+    }
+    
+    if CBE_API_KEY:
+        headers_base["Authorization"] = f"Bearer {CBE_API_KEY}"
+    
+    # Test different @class values for /notify endpoint
+    class_names = [
+        "com.cbe.transaction.dto.TransactionNotifyRequest",
+        "com.cbe.api.transaction.TransactionNotifyRequest",
+        "com.cbe.transaction.TransactionNotifyRequest",
+        "com.cbe.notification.TransactionNotifyRequest",
+        "com.cbe.dto.TransactionNotifyRequest",
+        "TransactionNotifyRequest",
+    ]
+    
+    for class_name in class_names:
+        try:
+            payload = {
+                "@class": class_name,
+                "transactionId": tx_id,
+                "amount": amount,
+                "currency": "ETB",
+                "beneficiary": receiver,
+                "status": "COMPLETED",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            
+            log.info(f"[NOTIFY ATTEMPT] @class={class_name}")
+            log.info(f"[PAYLOAD] {json.dumps(payload)}")
+            
+            resp = requests.post(
+                CBE_FORWARD_URL,
+                json=payload,
+                headers=headers_base,
+                timeout=10,
+                verify=False
+            )
+            status = f"HTTP_{resp.status_code}"
+            
+            log.info(f"[RESPONSE] Status: {status}")
+            log.info(f"[RESPONSE] Body: {resp.text[:300]}")
+            
+            # Store response with class name info
+            response_text = f"@class: {class_name}\nStatus: {status}\n{resp.text}"
+            return status, response_text
+            
+        except Exception as exc:
+            log.error(f"[ERROR] {class_name}: {str(exc)}")
+            continue
+    
+    return "all_attempts_failed", None
 
 @app.before_request
 def setup():
@@ -122,7 +131,6 @@ def handle_webhook():
         qr_string = raw_bytes.decode('utf-8', errors='ignore')
         
         log.info(f"[WEBHOOK] Received QR of length: {len(qr_string)}")
-        log.info(f"[WEBHOOK] QR Data: {qr_string[:100]}...")
         
         # Extract transaction ID from QR
         txn_match = re.search(r"(Txn_[A-Za-z0-9]+)", qr_string)
@@ -130,7 +138,6 @@ def handle_webhook():
         
         # Parse EMV QR data
         parsed_qr = parse_emv_qr(qr_string)
-        log.info(f"[WEBHOOK] Parsed tags: {list(parsed_qr.keys())}")
         
         # Extract amount (tag 54 in EMV format)
         amount_str = parsed_qr.get("54", "0")
